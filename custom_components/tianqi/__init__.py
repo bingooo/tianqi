@@ -667,7 +667,7 @@ class XEntity(Entity):
                 if k not in data:
                     continue
                 self._attr_extra_state_attributes[k] = data[k]
-        _LOGGER.info('%s: State changed: %s', self.entity_id, data)
+        _LOGGER.debug('%s: State changed: %s', self.entity_id, data)
 
 
 class StationInfo:
