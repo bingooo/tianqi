@@ -7,6 +7,9 @@ import base64
 import voluptuous as vol
 
 from datetime import datetime, timedelta
+from functools import wraps
+from typing import Callable, Set, Type, Tuple
+from aiohttp import ClientError, ClientResponseError, ClientConnectorDNSError
 
 from homeassistant.const import (
     Platform,
@@ -38,7 +41,7 @@ SUPPORTED_PLATFORMS = [
     Platform.BINARY_SENSOR,
 ]
 HTTP_REFERER = base64.b64decode('aHR0cHM6Ly9tLndlYXRoZXIuY29tLmNuLw==').decode()
-USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_1) AppleWebKit/537 (KHTML, like Gecko) Chrome/116.0 Safari/537'
+USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36'
 
 
 async def async_setup(hass: HomeAssistant, hass_config):
@@ -128,14 +131,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         },
     })
 
-    await hass.config_entries.async_forward_entry_setups(entry, SUPPORTED_PLATFORMS)
-
     entry.async_on_unload(entry.add_update_listener(async_update_options))
+
     if client := await TianqiClient.from_config(hass, entry):
         entry.async_on_unload(
             hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, client.unload)
         )
 
+    await hass.config_entries.async_forward_entry_setups(entry, SUPPORTED_PLATFORMS)
     await client.init()
     return ret
 
@@ -165,6 +168,53 @@ async def async_add_setuper(hass: HomeAssistant, config, domain, setuper):
             await client.setup_entities(domain)
 
 
+def aiohttp_retry(
+    max_retries: int = 10,
+    backoff_factor: float = 2.0,
+    retry_on_status: Optional[Set[int]] = None,
+    exceptions: Tuple[Type[BaseException], ...] = (ClientError, asyncio.TimeoutError),
+):
+    """
+    aiohttp 请求自动重试装饰器。
+    :param max_retries: 最大重试次数（不包括第一次请求）
+    :param backoff_factor: 退避因子（秒）。用于计算重试前的等待时间。
+    :param retry_on_status: 一个包含需要重试的 HTTP 状态码的集合。如果为 None，则默认重试 5xx 错误
+    :param exceptions: 一个需要捕获并触发重试的异常元组
+    """
+    if retry_on_status is None:
+        retry_on_status = {500, 502, 503, 504}
+
+    def decorator(func: Callable):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            last_exception = None
+            for attempt in range(max_retries + 1):
+                try:
+                    return await func(*args, **kwargs)
+                except exceptions as exc:
+                    _LOGGER.warning("Error while fetching data from %s", func.__name__, exc_info=True)
+                    last_exception = exc
+                    if attempt == max_retries:
+                        break
+                        
+                    is_retryable_status = False
+                    # DNS 错误和超时
+                    if isinstance(exc, ClientConnectorDNSError):
+                        is_retryable_status = True
+                    # HTTP 状态码错误
+                    if isinstance(exc, ClientResponseError):
+                        if exc.status in retry_on_status:
+                            is_retryable_status = True
+                    if not is_retryable_status:
+                        break
+                    delay = backoff_factor * (2 ** attempt)
+                    await asyncio.sleep(delay)
+            if last_exception:
+                raise last_exception
+        return wrapper
+    return decorator
+
+
 class TianqiClient:
     log = _LOGGER
 
@@ -172,6 +222,7 @@ class TianqiClient:
         self.hass = hass
         self.config = config or {}
         self.entry_id = self.config.get('entry_id') or 'yaml'
+        self.entry = hass.config_entries.async_get_entry(self.entry_id)
         self.data = {}
         self.setups = {}
         self.entities = {}
@@ -179,7 +230,10 @@ class TianqiClient:
 
         self.http = aiohttp_client.async_create_clientsession(
             hass,
-            timeout=aiohttp.ClientTimeout(total=20),
+            timeout=aiohttp.ClientTimeout(
+                total=60,
+                connect=30,
+            ),
             auto_cleanup=False,
         )
         self.http._default_headers = {
@@ -191,36 +245,42 @@ class TianqiClient:
             DataUpdateCoordinator(
                 hass, _LOGGER,
                 name='alarms',
+                config_entry=self.entry,
                 update_method=self.update_alarms,
                 update_interval=timedelta(minutes=5),
             ),
             DataUpdateCoordinator(
                 hass, _LOGGER,
                 name='summary',
+                config_entry=self.entry,
                 update_method=self.update_summary_and_entities,
                 update_interval=timedelta(seconds=60),
             ),
             DataUpdateCoordinator(
                 hass, _LOGGER,
                 name='dailies',
+                config_entry=self.entry,
                 update_method=self.update_dailies,
                 update_interval=timedelta(minutes=60),
             ),
             DataUpdateCoordinator(
                 hass, _LOGGER,
                 name='observe',
+                config_entry=self.entry,
                 update_method=self.update_observe,
                 update_interval=timedelta(minutes=30),
             ),
             DataUpdateCoordinator(
                 hass, _LOGGER,
                 name='hourlies',
+                config_entry=self.entry,
                 update_method=self.update_hourlies,
                 update_interval=timedelta(minutes=30),
             ),
             DataUpdateCoordinator(
                 hass, _LOGGER,
                 name='minutely',
+                config_entry=self.entry,
                 update_method=self.update_minutely,
                 update_interval=timedelta(minutes=2),
             ),
@@ -403,6 +463,7 @@ class TianqiClient:
     def station_name(self):
         return self.station.area_name or self.station_code
 
+    @aiohttp_retry()
     async def get_station(self, area_id=None, lat=None, lng=None):
         api = self.api_url('geong/v1/api', node='d7')
         pms = {'method': 'stationinfo'}
@@ -459,7 +520,8 @@ class TianqiClient:
             tim = int(time.time() * 1000)
             sep = '&' if '?' in api else '?'
             api = f'{api}{sep}_={tim}'
-        return f'{base}{api}'.replace('https://www', 'http://www')
+        base = base.replace('https://d3', 'http://d3')
+        return f'{base}{api}'
 
     def web_url(self, path, node='m'):
         return self.api_url(path, node, with_time=False)
@@ -475,6 +537,7 @@ class TianqiClient:
         await self.update_entities()
         return self.data
 
+    @aiohttp_retry()
     async def update_summary(self, **kwargs):
         api = self.api_url('weather_index/%s.html' % kwargs.get('area_id', self.area_id))
         res = await self.http.get(api, allow_redirects=False, verify_ssl=False)
@@ -495,6 +558,7 @@ class TianqiClient:
 
         return self.data
 
+    @aiohttp_retry()
     async def update_alarms(self, **kwargs):
         api = self.api_url('dingzhi/%s.html' % kwargs.get('area_id', self.area_id))
         res = await self.http.get(api, allow_redirects=False, verify_ssl=False)
@@ -512,6 +576,7 @@ class TianqiClient:
 
         return self.data
 
+    @aiohttp_retry()
     async def update_dailies(self, **kwargs):
         api = self.api_url('weixinfc/%s.html' % kwargs.get('area_id', self.area_id))
         res = await self.http.get(api, allow_redirects=False, verify_ssl=False)
@@ -528,6 +593,7 @@ class TianqiClient:
 
         return self.data
 
+    @aiohttp_retry()
     async def update_hourlies(self, **kwargs):
         api = self.api_url('wap_180h/%s.html' % kwargs.get('area_id', self.area_id))
         res = await self.http.get(api, allow_redirects=False, verify_ssl=False)
@@ -544,6 +610,7 @@ class TianqiClient:
 
         return self.data
 
+    @aiohttp_retry()
     async def update_minutely(self, **kwargs):
         api = self.api_url('webgis_rain_new/webgis/minute', 'd3')
         pms = {
@@ -564,6 +631,7 @@ class TianqiClient:
 
         return self.data
 
+    @aiohttp_retry()
     async def update_observe(self, **kwargs):
         api = self.api_url('weather/%s.shtml' % kwargs.get('area_id', self.area_id), 'www')
         res = await self.http.get(api, allow_redirects=False, verify_ssl=False)
@@ -638,13 +706,13 @@ class XEntity(Entity):
 
     async def async_added_to_hass(self):
         """Run when entity about to be added to hass."""
+        self.added = True
         if hasattr(self, 'async_get_last_state'):
             state: State = await self.async_get_last_state()
             if state:
                 self.async_restore_last_state(state.state, state.attributes)
                 return
 
-        self.added = True
         await super().async_added_to_hass()
 
     @callback
