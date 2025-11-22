@@ -9,7 +9,6 @@ import voluptuous as vol
 from datetime import datetime, timedelta
 from functools import wraps
 from typing import Callable, Set, Type, Tuple
-from aiohttp import ClientError, ClientResponseError, ClientConnectorDNSError
 
 from homeassistant.const import (
     Platform,
@@ -172,7 +171,7 @@ def aiohttp_retry(
     max_retries: int = 10,
     backoff_factor: float = 2.0,
     retry_on_status: Optional[Set[int]] = None,
-    exceptions: Tuple[Type[BaseException], ...] = (ClientError, asyncio.TimeoutError),
+    exceptions: Tuple[Type[BaseException], ...] = (aiohttp.ClientError, asyncio.TimeoutError),
 ):
     """
     aiohttp 请求自动重试装饰器。
@@ -196,13 +195,8 @@ def aiohttp_retry(
                     last_exception = exc
                     if attempt == max_retries:
                         break
-                        
-                    is_retryable_status = False
-                    # DNS 错误和超时
-                    if isinstance(exc, ClientConnectorDNSError):
-                        is_retryable_status = True
-                    # HTTP 状态码错误
-                    if isinstance(exc, ClientResponseError):
+                    is_retryable_status = isinstance(exc, aiohttp.ClientConnectorDNSError)
+                    if isinstance(exc, aiohttp.ClientResponseError):
                         if exc.status in retry_on_status:
                             is_retryable_status = True
                     if not is_retryable_status:
@@ -282,7 +276,7 @@ class TianqiClient:
                 name='minutely',
                 config_entry=self.entry,
                 update_method=self.update_minutely,
-                update_interval=timedelta(minutes=2),
+                update_interval=timedelta(minutes=5),
             ),
         ]
         self._remove_listeners = []
@@ -520,7 +514,6 @@ class TianqiClient:
             tim = int(time.time() * 1000)
             sep = '&' if '?' in api else '?'
             api = f'{api}{sep}_={tim}'
-        base = base.replace('https://d3', 'http://d3')
         return f'{base}{api}'
 
     def web_url(self, path, node='m'):
@@ -612,7 +605,7 @@ class TianqiClient:
 
     @aiohttp_retry()
     async def update_minutely(self, **kwargs):
-        api = self.api_url('webgis_rain_new/webgis/minute', 'd3')
+        api = self.api_url('mpf_v3/webgis/minute', 'mpf')
         pms = {
             'lat': self.station.latitude,
             'lon': self.station.longitude,
